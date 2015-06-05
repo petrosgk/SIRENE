@@ -12,13 +12,14 @@
 #include "antcc/Header.hh"
 #include "antcc/Event.hh" 
 
-#include "dataformat/AntaresTree.hh"
+#include "JROOT/JRootTree.hh"
 
+#include "JLang/JSharedPointer.hh"
 #include "Jeep/JTimer.hh"
 #include "Jeep/JParser.hh"
 #include "Jeep/JMessage.hh"
 #include "JPhysics/JPDFLibrary.hh"
-#include "JPhysics/JPDFTable.hh"
+#include "JPhysics/JCDFTable.hh"
 #include "JPhysics/JRadiationSource.hh"
 #include "JTools/JFunction1D_t.hh"
 #include "JTools/JFunctionalMap_t.hh"
@@ -27,8 +28,8 @@
 #include "JSirene/JEvent.hh"
 #include "JSirene/JPythia.hh"
 #include "JSirene/JSeaWater.hh"
-#include "JSirene/JCDFTable.hh"
-#include "JDetector/JMonteCarloDetector.hh"
+#include "JSirene/JCDFTable1D.hh"
+#include "JSirene/JCDFTable2D.hh"
 #include "JDetector/JDetector.hh"
 #include "JDetector/JDetectorSubset.hh"
 #include "JDetector/JDetectorToolkit.hh"
@@ -57,6 +58,7 @@ int main(int argc, char **argv)
   Long64_t       numberOfEvents;
   double         Tmax;
   bool           geasim;
+  bool           writeEMShowers;
   int            debug;
 
   try { 
@@ -64,12 +66,13 @@ int main(int argc, char **argv)
     JParser<> zap;
     
     zap['F'] = make_field(fileDescriptor);
-    zap['f'] = make_field(inputFile);         
+    zap['f'] = make_field(inputFile);
     zap['o'] = make_field(outputFile)        = "sirene.root";
     zap['a'] = make_field(interfaceInput);
     zap['n'] = make_field(numberOfEvents)    = numeric_limits<Long64_t>::max();
     zap['T'] = make_field(Tmax)              = 0.0;
     zap['G'] = make_field(geasim);
+    zap['s'] = make_field(writeEMShowers);
     zap['d'] = make_field(debug)             = 1;
     
     if (zap.read(argc, argv) != 0)
@@ -88,7 +91,10 @@ int main(int argc, char **argv)
   using namespace JLANG;
 
   typedef JSplineFunction1D_t                                     JFunction1D_t;
-  typedef JMultipleMap<3, JPolint1FunctionalGridMap>::type_list   J3DMap_t;
+  typedef 
+    JMapList<JPolint1FunctionalMap,
+    JMapList<JPolint1FunctionalGridMap,
+    JMapList<JPolint1FunctionalGridMap> > >                       J3DMap_t;
   typedef 
     JMapList<JPolint1FunctionalMap,
     JMapList<JPolint1FunctionalMap,
@@ -139,8 +145,8 @@ int main(int argc, char **argv)
 
   if (f1 .intensity.rbegin()->first > maximal_road_width) maximal_road_width = f1 .intensity.rbegin()->first;
   if (f2 .intensity.rbegin()->first > maximal_road_width) maximal_road_width = f2 .intensity.rbegin()->first;
-   if (f13.intensity.rbegin()->first > maximal_road_width) maximal_road_width = f13.intensity.rbegin()->first;
-     if (f14.intensity.rbegin()->first > maximal_road_width) maximal_road_width = f14.intensity.rbegin()->first;
+  if (f13.intensity.rbegin()->first > maximal_road_width) maximal_road_width = f13.intensity.rbegin()->first;
+  if (f14.intensity.rbegin()->first > maximal_road_width) maximal_road_width = f14.intensity.rbegin()->first;
 
   NOTICE("Maximal road width [m] " << maximal_road_width << endl);
 
@@ -170,7 +176,7 @@ int main(int argc, char **argv)
   NOTICE("OK" << endl);
 
 
-  vector< JObject<JRadiationInterface> > radiation;
+  vector< JSharedPointer<JRadiationInterface> > radiation;
 
   if (true) {
 
@@ -203,27 +209,19 @@ int main(int argc, char **argv)
     NOTICE("OK" << endl);
   }
 
+  JDetector detector;
 
-  JMonteCarloDetector detector(true);
-
-  if      (interfaceInput.find(".det") != string::npos)
-    detector.JMonteCarloDetector::load(interfaceInput.c_str());
-  else if (interfaceInput.find(".dat") != string::npos)
-    detector.JDetector::load(interfaceInput.c_str());
-  else
-    FATAL("Fatal error detector geometry." << endl);
-
-
+  try {
+    load(interfaceInput, detector);
+  }
+  catch(const JException& error) {
+    FATAL(error);
+  }
 
   // ROOT I/O
 
- NOTICE("OK" << endl);
-  
-
- for (vector<string>::const_iterator i = inputFile.begin(); i != inputFile.end(); ++i) 
-   MonteCarloEvent_Reader.Add(i->c_str());
-
-NOTICE("OK" << endl);
+  for (vector<string>::const_iterator i = inputFile.begin(); i != inputFile.end(); ++i)
+    MonteCarloEvent_Reader.Add(i->c_str());
 
   Header header(MonteCarloEvent_Reader);
 
@@ -234,27 +232,9 @@ NOTICE("OK" << endl);
     WARNING("Recovering can." << endl);
 
     JCylinder cyl(detector);
-   
 
-     header.can = MONTE_CARLO::can(cyl.getZmin(), cyl.getZmax(), cyl.getRadius());
-    // header.can  = MONTE_CARLO::can(-479.900,    581.510,    1664.250);
-
-    // header.can  = MONTE_CARLO::can(48.6538, 1107.6, 1359.07);
-    // header.can = MONTE_CARLO::can(-459.99, 561.12, 1862.07);
-
-    // header.can = MONTE_CARLO::can(-479.90, 581.51, 1862.07);
-    // header.can  = MONTE_CARLO::can(-405.93, 561.12, 1960.58);
-    // header.can  = MONTE_CARLO::can(-459.99, 561.12, 1960.58);
-    //////////////////////////////////////////////
-    // header.can  = MONTE_CARLO::can(1000.00, 1296.00, 1296.00);
-     
-      ////////////////////////////////////////
-    // NOTICE("cyl.getZmin()"<<cyl.getZmin() << endl);
-     //  NOTICE("cyl.getZmax()"<<cyl.getZmax() << endl);
-     // NOTICE("cyl.getRadius()"<<cyl.getRadius() << endl);
-
-       cout << "getting through" << endl;
-
+    header.can = MONTE_CARLO::can(cyl.getZmin(), cyl.getZmax(), cyl.getRadius());
+    
     // expand can
 
     header.can.zmin -= maximal_road_width;
@@ -262,26 +242,13 @@ NOTICE("OK" << endl);
     header.can.r    += maximal_road_width;
   }
 
-
-
-  // if (header.start_run) Event::set_runNumber(header.start_run.run_id);
-  //  Double_t EventID;
-  
-  //////////////////////////////tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt
-
-  // if (header.start_run) Event::set_runNumber(inputFile);
-
-
   if (header.start_run) Event::set_runNumber(header.start_run.run_id);
 
-       cout << "getting the runnumber " << endl;
-
- if (!header.coord_origin && header.can) {
+  if (!header.coord_origin && header.can) {
 
     WARNING("Setting coordinate origin relative to bottom of can." << endl);
 
-     header.coord_origin = MONTE_CARLO::coord_origin(0.0, 0.0, -header.can.zmin);
-    // header.coord_origin = MONTE_CARLO::coord_origin(0.0, 0.0, 0.0);
+    header.coord_origin = MONTE_CARLO::coord_origin(0.0, 0.0, -header.can.zmin);
   }
 
   if (header.coord_origin) {
@@ -295,19 +262,9 @@ NOTICE("OK" << endl);
     WARNING("Missing coordinate origin." << endl);
 
 
-  /////////////////////////////////
-  // NOTICE("header.coord_origin.x"<<header.coord_origin.x << endl);
-  //NOTICE("header.coord_origin.y"<<header.coord_origin.y << endl);
-  //NOTICE("header.coord_origin.z"<<header.coord_origin.z << endl);
-  ///////////////////////////////////
-
-
   TFile* out = new TFile(outputFile.c_str(), "recreate");
 
   if (out == NULL || !out->IsOpen()) FATAL("Error opening file " << outputFile << endl);
-
-
-  cout << "enough with header" << endl;
 
 
   header.Write();
@@ -358,30 +315,18 @@ NOTICE("OK" << endl);
 
 	if (Zbed > track->position().z) {
 
-       
 	  // propagate muon through rock
 	    
 	  const double ds = (Zbed - track->position().z) / track->direction().z;
-
 
 	  if (geaneRock(E0) < ds)  continue;
 
 	  E0  = geaneRock(E0, ds);
 	  z0 += ds;
 	  t0 += ds / C;
-
-
-//cout << " propagate muon through rock" << endl;
-
-	  /////////////////////////////////////////
-	  //  NOTICE("ds"<<ds << endl);
-	  // NOTICE("Zbed"<<Zbed << endl);
-	  /////////////////////
 	}
 
 	if (Zmin > z0) {
-
-	  // NOTICE("z0"<<z0 << endl);
 
 	  // propagate muon through water
 	    
@@ -394,19 +339,18 @@ NOTICE("OK" << endl);
 	  t0 += ds / C;
 	}
 
-
-//cout << " propagate muon through water" << endl;
-
 	job.Fill(3.0);
 
+	const JGeometry trackGeometry = getGeometry(*track);
+        const JRotation3D trackRotation(trackGeometry.getDirection());
+
+        JPoint3D trackPosition = trackGeometry.getPosition();
+        trackPosition.rotate(trackRotation);
+        JDirection3D trackDirection = trackGeometry.getDirection();
 
 	const JDetectorSubset subdetector(detector, getGeometry(*track), maximal_road_width);
 
 	if (subdetector.empty()) continue;
-
-//cout << " subdetector" << endl;
-
-
 
 	job.Fill(4.0);
 
@@ -446,7 +390,7 @@ NOTICE("OK" << endl);
 
 
 	  // generate direct and scattered light from muon
-
+	  
 	  for (JDetector::const_iterator module = subdetector.lower_bound(z0); module != subdetector.end(); ++module) {
 
 	    const double R = module->getX();
@@ -460,8 +404,7 @@ NOTICE("OK" << endl);
 	      for (int i = 0; i != 2; ++i) {
 		      
 		const double Rmax = CDF[i].integral->getUpperKey();
-		//cout << " Rmax" << Rmax<< endl;
-
+		
 		if (R < Rmax) {
 		
 		  try {
@@ -480,11 +423,7 @@ NOTICE("OK" << endl);
 			
 			const double npe = CDF[i].function->getNPE(R, theta, phi);
 
-//cout << " npe" << npe << endl;
-
 			int n1 = getNumberOfPhotoElectrons(NPE, N, npe);
-
-//cout << " n1" << NPE << "N" <<N << "npe" <<npe<< endl;
 
 			job.Fill((double) (101 + i), (double) n1);
 
@@ -507,9 +446,6 @@ NOTICE("OK" << endl);
 		      }
 		    }
 		  }
-
-
-  
 		  catch(const exception& error) {
 		    job.Fill((double) (201 + i));
 		  }
@@ -522,6 +458,24 @@ NOTICE("OK" << endl);
 	  // generate direct and scattered light from EM shower.
 
 	  if (Es >= Ecut) {
+	    
+	    // store shower at z0+step as Secondary with energy Es and code -1
+	    if(writeEMShowers) {
+	      JPoint3D showerPosition(trackPosition.getX(),trackPosition.getY(),z0+step);
+	      showerPosition.rotate_back(trackRotation);
+	      
+	      Secondary showerOnTrack;
+	      showerOnTrack.set_id(event.secondary().size()+1);
+	      showerOnTrack.set_t(t0+step/C);
+	      showerOnTrack.set_position(showerPosition.getX(),showerPosition.getY(),showerPosition.getZ());
+	      showerOnTrack.set_direction(trackDirection.getDX(),trackDirection.getDY(),trackDirection.getDZ());
+	      showerOnTrack.set_E(Es);
+	      showerOnTrack.set_type(-1); //negative gamma particle code
+	      showerOnTrack.set_origin(track->id());
+	      showerOnTrack.validate();
+	      
+	      event.Add(showerOnTrack);
+	    }
 	    
 	    for (JDetector::const_iterator module = subdetector.lower_bound(z0 - maximal_road_width); module != subdetector.end(); ++module) {
 	      
@@ -577,9 +531,6 @@ NOTICE("OK" << endl);
 			  
 			  const Hit hit(id, pmt->getID(), t1, a1, type, track->id(), a1, t1);
 			  
-
-//cout << " hit em" << hit << endl;
-
 			  event.Add(hit);
 			  
 			  n1 -= n;
@@ -587,8 +538,6 @@ NOTICE("OK" << endl);
 		      }
 		    }
 		  }
-
-
 		  catch(const exception& error) {
 		    job.Fill((double) (213 + i));
 		  }
@@ -684,11 +633,7 @@ NOTICE("OK" << endl);
 			
 			const double npe = CDG[i].function->getNPE(D, cd, theta, phi) * Es;
 			
-
-//cout << "npe secondaries" << npe << "theta" << theta << "phi" <<phi<< endl;
 			int n1 = getNumberOfPhotoElectrons(NPE, N, npe);
-
-
 
 			job.Fill((double) (123 + i), (double) n1);
 
@@ -727,8 +672,6 @@ NOTICE("OK" << endl);
 		      }
 		    }
 		  }
-
-
 		  catch(const exception& error) {
 		    job.Fill((double) (223 + i));
 		  }
