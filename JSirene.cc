@@ -1,4 +1,3 @@
-
 #include <string>
 #include <iostream>
 #include <iomanip>
@@ -18,7 +17,7 @@
 #include "Jeep/JTimer.hh"
 #include "Jeep/JParser.hh"
 #include "Jeep/JMessage.hh"
-#include "JPhysics/JPDFLibrary.hh"
+#include "JPhysics/JPDFToolkit.hh"
 #include "JPhysics/JCDFTable.hh"
 #include "JPhysics/JRadiationSource.hh"
 #include "JTools/JFunction1D_t.hh"
@@ -33,13 +32,20 @@
 #include "JDetector/JDetector.hh"
 #include "JDetector/JDetectorSubset.hh"
 #include "JDetector/JDetectorToolkit.hh"
+#include "JGeometry3D/JCylinder3D.hh"
 
+#include "JSupport/JMultipleFileScanner.hh"
+#include "JSupport/JFileRecorder.hh"
+#include "JSupport/JMonteCarloToolkit.hh"
+#include "JSupport/JSupport.hh"
+
+#include "omp.h"
 
 /**   --------------------------------------------------------------------------
  *   |                                                                          |
  *   |  Program to simulate detector response to muons and showers.             |
  *   |                                                                          |
- *   |   - PDF file descriptor should contain '%' character;                    |
+ *   |   - CDF file descriptor should contain '%' character;                    |
  *   |     The file names are obtained by replacing % with 1, 2, 13 and 14;     |
  *   |                                                                          |
  *   |   - Detector geometry is read from .det file;                            |
@@ -47,682 +53,824 @@
  *   |   - Events are read from / written to ROOT formatted .evt file;          |
  *    --------------------------------------------------------------------------
  */
-int main(int argc, char **argv)
-{
-  using namespace std;
-
-  string         fileDescriptor;
-  vector<string> inputFile;
-  string         outputFile;
-  string         interfaceInput;
-  Long64_t       numberOfEvents;
-  double         Tmax;
-  bool           geasim;
-  bool           writeEMShowers;
-  int            debug;
-
-  try { 
-
-    JParser<> zap;
-    
-    zap['F'] = make_field(fileDescriptor);
-    zap['f'] = make_field(inputFile);
-    zap['o'] = make_field(outputFile)        = "sirene.root";
-    zap['a'] = make_field(interfaceInput);
-    zap['n'] = make_field(numberOfEvents)    = numeric_limits<Long64_t>::max();
-    zap['T'] = make_field(Tmax)              = 0.0;
-    zap['G'] = make_field(geasim);
-    zap['s'] = make_field(writeEMShowers);
-    zap['d'] = make_field(debug)             = 1;
-    
-    if (zap.read(argc, argv) != 0)
-      return 1;
-  }
-  catch(const exception &error) {
-    ERROR(error.what() << endl);
-    return 2;
-  }
-
-
-  using namespace JTOOLS;
-  using namespace JPHYSICS;
-  using namespace JSIRENE;
-  using namespace JEEP;
-  using namespace JLANG;
-
-  typedef JSplineFunction1D_t                                     JFunction1D_t;
-  typedef 
-    JMapList<JPolint1FunctionalMap,
-    JMapList<JPolint1FunctionalGridMap,
-    JMapList<JPolint1FunctionalGridMap> > >                       J3DMap_t;
-  typedef 
-    JMapList<JPolint1FunctionalMap,
-    JMapList<JPolint1FunctionalMap,
-    JMapList<JPolint1FunctionalGridMap,
-    JMapList<JPolint1FunctionalGridMap> > > >                     J4DMap_t;
-
-  typedef JCDFTable<JFunction1D_t, J3DMap_t>                      JCDF4D_t;
-  typedef JCDFTable<JFunction1D_t, J4DMap_t>                      JCDF5D_t;
-
-  JCDF4D_t f1;       // direct    light from muon
-  JCDF4D_t f2;       // scattered light from muon
-  JCDF5D_t f13;      // direct    light from EM shower
-  JCDF5D_t f14;      // scattered light from EM shower
-
-  const double a    = 2.67e-1 * DENSITY_SEA_WATER;     // Ionisation energy loss [Gev/m]
-  const double Ecut = 0.1;                             // minimal energy for generation of light from shower [GeV]
-  const double Emin = 1.0;                             // minimal energy of muon for shower generation [GeV]
-  double       Zbed = 0.0;                             // level of seabed [m]
-
-
-  for (string buffer[] = { "1", "2", "13", "14", ""}, *k = buffer; *k != ""; ++k) {
-
-    string file_name = fileDescriptor;
-
-    string::size_type ipos = file_name.find('%');
-
-    if (ipos == string::npos) FATAL("error file descriptor " << fileDescriptor << endl);
-
-    file_name.replace(ipos, 1, *k);
-    
-    NOTICE("loading input from file " << file_name << "... " << flush);
-
-    try {
-      if (*k ==  "1") f1 .load(file_name.c_str());
-      if (*k ==  "2") f2 .load(file_name.c_str());
-      if (*k == "13") f13.load(file_name.c_str());
-      if (*k == "14") f14.load(file_name.c_str());
-    }      
-    catch(const JException& error) {
-      FATAL(error.what() << endl);
-    }
-    
-    NOTICE("OK" << endl);
-  }
-
-
-  double maximal_road_width = 0.0;  // [m]
-
-  if (f1 .intensity.rbegin()->first > maximal_road_width) maximal_road_width = f1 .intensity.rbegin()->first;
-  if (f2 .intensity.rbegin()->first > maximal_road_width) maximal_road_width = f2 .intensity.rbegin()->first;
-  if (f13.intensity.rbegin()->first > maximal_road_width) maximal_road_width = f13.intensity.rbegin()->first;
-  if (f14.intensity.rbegin()->first > maximal_road_width) maximal_road_width = f14.intensity.rbegin()->first;
-
-  NOTICE("Maximal road width [m] " << maximal_road_width << endl);
-
-  NOTICE("Setting up fast CDF tables... " << flush);
-
-  typedef JFunction1D_t::argument_type               argument_type;
-  typedef JFunction1D_t::result_type                 result_type;
-
-  typedef JCDFTable1D<argument_type, result_type>    JCDF1D_t;
-  typedef JCDFTable2D<argument_type, result_type>    JCDF2D_t;
-  
-  const JCDF1D_t f1s (f1,  200);
-  const JCDF1D_t f2s (f2,  200);
-  const JCDF2D_t f13s(f13, 200);
-  const JCDF2D_t f14s(f14, 200);
-
-  struct {
-    const JCDF1D_t* integral;
-    const JCDF4D_t* function;
-  } CDF[] = { { &f1s, &f1 }, { &f2s, &f2 } };
-
-  struct {
-    const JCDF2D_t* integral;
-    const JCDF5D_t* function;
-  } CDG[] = { { &f13s, &f13 }, { &f14s, &f14 } };
-
-  NOTICE("OK" << endl);
-
-
-  vector< JSharedPointer<JRadiationInterface> > radiation;
-
-  if (true) {
-
-    NOTICE("Setting up radiation tables... " << flush);
-
-    const JRadiation hydrogen( 1.0,  1.0, 40, 0.01, 0.1, 0.1);
-    const JRadiation oxygen  ( 8.0, 16.0, 40, 0.01, 0.1, 0.1);
-    const JRadiation chlorine(17.0, 35.0, 40, 0.01, 0.1, 0.1);
-
-    const JRadiationFunction Hydrogen(hydrogen, 300, 0.2, 1.0e11);
-    const JRadiationFunction Oxygen  (oxygen,   300, 0.2, 1.0e11);
-    const JRadiationFunction Chlorine(chlorine, 300, 0.2, 1.0e11);
-    
-    JRadiationSource::source_type EErad(&JRadiation::TotalCrossSectionEErad, &JRadiation::EfromEErad);
-    JRadiationSource::source_type Brems(&JRadiation::TotalCrossSectionBrems, &JRadiation::EfromBrems);
-    JRadiationSource::source_type GNrad(&JRadiation::TotalCrossSectionGNrad, &JRadiation::EfromGNrad);
-
-    radiation.push_back(JRadiationSource(Oxygen,   DENSITY_SEA_WATER * JSeaWater::O,  EErad));
-    radiation.push_back(JRadiationSource(Chlorine, DENSITY_SEA_WATER * JSeaWater::Cl, EErad));
-    radiation.push_back(JRadiationSource(Hydrogen, DENSITY_SEA_WATER * JSeaWater::H,  EErad));
-
-    radiation.push_back(JRadiationSource(Oxygen,   DENSITY_SEA_WATER * JSeaWater::O,  Brems));
-    radiation.push_back(JRadiationSource(Chlorine, DENSITY_SEA_WATER * JSeaWater::Cl, Brems));
-    radiation.push_back(JRadiationSource(Hydrogen, DENSITY_SEA_WATER * JSeaWater::H,  Brems));
-
-    radiation.push_back(JRadiationSource(Oxygen,   DENSITY_SEA_WATER * JSeaWater::O,  GNrad));
-    radiation.push_back(JRadiationSource(Chlorine, DENSITY_SEA_WATER * JSeaWater::Cl, GNrad));
-    radiation.push_back(JRadiationSource(Hydrogen, DENSITY_SEA_WATER * JSeaWater::H,  GNrad));
-
-    NOTICE("OK" << endl);
-  }
-
-  JDetector detector;
-
-  try {
-    load(interfaceInput, detector);
-  }
-  catch(const JException& error) {
-    FATAL(error);
-  }
-
-  // ROOT I/O
-
-  for (vector<string>::const_iterator i = inputFile.begin(); i != inputFile.end(); ++i)
-    MonteCarloEvent_Reader.Add(i->c_str());
-
-  Header header(MonteCarloEvent_Reader);
-
-  NOTICE("Monte Carlo Event tree: " << MonteCarloEvent_Reader.GetEntries() << " " << header.getNumberOfHeaders() << endl);
-  
-  if (!header.can) {
-
-    WARNING("Recovering can." << endl);
-
-    JCylinder cyl(detector);
-
-    header.can = MONTE_CARLO::can(cyl.getZmin(), cyl.getZmax(), cyl.getRadius());
-    
-    // expand can
-
-    header.can.zmin -= maximal_road_width;
-    header.can.zmax += maximal_road_width;
-    header.can.r    += maximal_road_width;
-  }
-
-  if (header.start_run) Event::set_runNumber(header.start_run.run_id);
-
-  if (!header.coord_origin && header.can) {
-
-    WARNING("Setting coordinate origin relative to bottom of can." << endl);
-
-    header.coord_origin = MONTE_CARLO::coord_origin(0.0, 0.0, -header.can.zmin);
-  }
-
-  if (header.coord_origin) {
-
-    detector -= JPoint3D(header.coord_origin.x,
-			 header.coord_origin.y,
-			 header.coord_origin.z);
-    Zbed     -=          header.coord_origin.z;
-
-  } else
-    WARNING("Missing coordinate origin." << endl);
-
-
-  TFile* out = new TFile(outputFile.c_str(), "recreate");
-
-  if (out == NULL || !out->IsOpen()) FATAL("Error opening file " << outputFile << endl);
-
-
-  header.Write();
-  
-  MonteCarloEvent_Writer.SetDirectory(out);
-
-  TProfile cpu("cpu", NULL,  14,  1.0,   7.0);
-  TH1D     job("job", NULL, 300,  0.5, 300.5);
-
-  JTimer timer;
-
-
-  numberOfEvents = min(numberOfEvents, MonteCarloEvent_Reader.GetEntries());
-
-  for (Long64_t event_count = 0; event_count < numberOfEvents; ++event_count) {
-
-    STATUS("event: " << setw(10) << event_count << '\r'); DEBUG(endl);
-
-    MonteCarloEvent_Reader.GetEvent(event_count);
-
-    job.Fill(1.0);
-
-    JEvent event(*MonteCarloEvent_Reader.GetAddress());
-
-    event.removeHits();
-
-    timer.reset();
-    timer.start();
-
-    for (vector<McTrack>::const_iterator track = event.TrackList().begin(); track != event.TrackList().end(); ++track) {
-
-      // (anti) muon
-
-      if (is_muon(*track)) {
-
-	job.Fill(2.0);
-
-	double E0 = track->E();
-	double z0 = 0.0;
-	double t0 = track->t();
-      
-	const pair<double, double> intersection = getIntersection(*track, header.can);
-
-	const double Zmin = intersection.first;
-	const double Zmax = intersection.second;
-
-	if (Zmax <= 0.0)       continue;
-
-	if (Zbed > track->position().z) {
-
-	  // propagate muon through rock
-	    
-	  const double ds = (Zbed - track->position().z) / track->direction().z;
-
-	  if (geaneRock(E0) < ds)  continue;
-
-	  E0  = geaneRock(E0, ds);
-	  z0 += ds;
-	  t0 += ds / C;
+int main(int argc, char **argv) {
+	using namespace std;
+	using namespace JSUPPORT;
+
+	string fileDescriptor;
+	JMultipleFileScanner<JMonteCarloTypes_t> inputFile;
+	JFileRecorder<JLANG::JAppend<JMonteCarloTypes_t, TRandom>::typelist> outputFile;
+	JLimit_t& numberOfEvents = inputFile.getLimit();
+	string detectorFile;
+	double Tmax;
+	bool geasim;
+	bool writeEMShowers;
+	UInt_t seed;
+	int debug;
+
+	// --- enable OpenMP ---
+	bool OMP = true;
+	if (!OMP) {
+		omp_set_num_threads(1);
+	} else {
+		omp_set_num_threads(4);
+	}
+	// --- enable OpenMP ---
+
+	try {
+
+		JParser<> zap;
+
+		zap['F'] = make_field(fileDescriptor);
+		zap['f'] = make_field(inputFile);
+		zap['o'] = make_field(outputFile)= "sirene.root";
+		zap['n'] = make_field(numberOfEvents)= JLimit::max();
+		zap['a'] = make_field(detectorFile);
+		zap['T'] = make_field(Tmax)= 0.0;
+		zap['G'] = make_field(geasim);
+		zap['s'] = make_field(writeEMShowers);
+		zap['S'] = make_field(seed)= 0;
+		zap['d'] = make_field(debug)= 1;
+
+		if (zap.read(argc, argv) != 0)
+			return 1;
+	} catch (exception &error) {
+		FATAL(error.what() << endl);
 	}
 
-	if (Zmin > z0) {
+	gRandom->SetSeed(seed);
 
-	  // propagate muon through water
-	    
-	  const double ds = Zmin - z0;
-	  
-	  if (geaneWater(E0) < ds)  continue;
+	using namespace JTOOLS;
+	using namespace JPHYSICS;
+	using namespace JSIRENE;
+	using namespace JEEP;
+	using namespace JLANG;
+	using namespace JGEOMETRY3D;
 
-	  E0  = geaneWater(E0, ds);
-	  z0 += ds;
-	  t0 += ds / C;
-	}
+	typedef JSplineFunction1D_t JFunction1D_t;
+	typedef JMapList<JPolint1FunctionalMap,
+			JMapList<JPolint1FunctionalGridMap,
+					JMapList<JPolint1FunctionalGridMap> > > J3DMap_t;
+	typedef JMapList<JPolint1FunctionalMap,
+			JMapList<JPolint1FunctionalMap,
+					JMapList<JPolint1FunctionalGridMap,
+							JMapList<JPolint1FunctionalGridMap> > > > J4DMap_t;
 
-	job.Fill(3.0);
+	typedef JCDFTable<JFunction1D_t, J3DMap_t> JCDF4D_t;
+	typedef JCDFTable<JFunction1D_t, J4DMap_t> JCDF5D_t;
 
-	const JGeometry trackGeometry = getGeometry(*track);
-        const JRotation3D trackRotation(trackGeometry.getDirection());
+	JCDF4D_t f1;       // direct    light from muon
+	JCDF4D_t f2;       // scattered light from muon
+	JCDF5D_t f13;      // direct    light from EM shower
+	JCDF5D_t f14;      // scattered light from EM shower
 
-        JPoint3D trackPosition = trackGeometry.getPosition();
-        trackPosition.rotate(trackRotation);
-        JDirection3D trackDirection = trackGeometry.getDirection();
+	double Ecut = 0.1; // minimal energy for generation of light from shower [GeV]
+	double Emin = 1.0; // minimal energy of muon for shower generation [GeV]
+	double Zbed = 0.0;                             // level of seabed [m]
 
-	const JDetectorSubset subdetector(detector, getGeometry(*track), maximal_road_width);
+	for (string buffer[] = { "1", "2", "13", "14", "" }, *k = buffer; *k != "";
+			++k) {
 
-	if (subdetector.empty()) continue;
+		string file_name = fileDescriptor;
 
-	job.Fill(4.0);
+		string::size_type ipos = file_name.find('%');
 
-
-	while (E0 > MASS_MUON * getIndexOfRefraction() && z0 < Zmax) {
-
-	
-	  const int N = radiation.size();
-	
-	  double li[N];                                       // inverse interaction lengths
-	  double ls = 1.0e-5;                                 // minimal total inverse interaction length (100 km)^-1
-	
-	  for (int i = 0; i != N; ++i)
-	    ls += li[i] = radiation[i]->getInverseInteractionLength(E0);
-
-	  const double step = min(gRandom->Exp(1.0) / ls, E0/a);
-
-      
-	  E0 -= a*step;                                       // ionisation energy loss
-	
-	  double Es = 0.0;                                    // shower energy [GeV]
-
-	  if (E0 >= Emin) {
-
-	    double y  = gRandom->Uniform(ls);
-
-	    for (int i = 0; i != N; ++i) {
-	      
-	      y -= li[i];
-	      
-	      if (y < 0.0) {
-		Es = radiation[i]->getEnergyOfShower(E0);     // shower energy [GeV]
-		break;
-	      }
-	    }
-	  }
-
-
-	  // generate direct and scattered light from muon
-	  
-	  for (JDetector::const_iterator module = subdetector.lower_bound(z0); module != subdetector.end(); ++module) {
-
-	    const double R = module->getX();
-	    const double Z = z0 - module->getZ();
-
-	    if (Z + step <  -maximal_road_width / getTanThetaC()) break;
-
-	    if (Z        <= -R / getTanThetaC() &&
-		Z + step >  -R / getTanThetaC()) {
-
-	      for (int i = 0; i != 2; ++i) {
-		      
-		const double Rmax = CDF[i].integral->getUpperKey();
-		
-		if (R < Rmax) {
-		
-		  try {
-
-		    const double NPE = CDF[i].integral->getNPE(R) * module->size();
-		    const int    N   = gRandom->Poisson(NPE); 
-		    
-		    if (N != 0) {
-
-		      for (JModule::const_iterator pmt = module->begin(); pmt != module->end(); ++pmt) {
-
-			const double R     = pmt->getX();
-			const double Z     = z0 - pmt->getZ();
-			const double theta = pmt->getTheta();
-			const double phi   = pmt->getPhi();
-			
-			const double npe = CDF[i].function->getNPE(R, theta, phi);
-
-			int n1 = getNumberOfPhotoElectrons(NPE, N, npe);
-
-			job.Fill((double) (101 + i), (double) n1);
-
-			while (n1 != 0) {
-			  
-			  const double dt = CDF[i].function->getTime(R, theta, phi, gRandom->Rndm());
-			  const int    n  = getNumberOfPhotoElectrons(n1);		  
-			  
-			  const double t1   =  t0  +  (R * getTanThetaC() - Z) / C  +  dt; 
-			  const double a1   =  n;
-			  const int    type = (i == 0 ? +5 : -5);
-			  const uint   id   =  event.HitList().size() + 1;
-			  
-			  const Hit hit(id, pmt->getID(), t1, a1, type, track->id(), a1, t1);
-			  
-			  event.Add(hit);
-
-			  n1 -= n;
-			}
-		      }
-		    }
-		  }
-		  catch(const exception& error) {
-		    job.Fill((double) (201 + i));
-		  }
+		if (ipos == string::npos) {
+			FATAL("error file descriptor " << fileDescriptor << endl);
 		}
-	      }
-	    }
-	  }
-	  
 
-	  // generate direct and scattered light from EM shower.
+		file_name.replace(ipos, 1, *k);
 
-	  if (Es >= Ecut) {
-	    
-	    // store shower at z0+step as Secondary with energy Es and code -1
-	    if(writeEMShowers) {
-	      JPoint3D showerPosition(trackPosition.getX(),trackPosition.getY(),z0+step);
-	      showerPosition.rotate_back(trackRotation);
-	      
-	      Secondary showerOnTrack;
-	      showerOnTrack.set_id(event.secondary().size()+1);
-	      showerOnTrack.set_t(t0+step/C);
-	      showerOnTrack.set_position(showerPosition.getX(),showerPosition.getY(),showerPosition.getZ());
-	      showerOnTrack.set_direction(trackDirection.getDX(),trackDirection.getDY(),trackDirection.getDZ());
-	      showerOnTrack.set_E(Es);
-	      showerOnTrack.set_type(-1); //negative gamma particle code
-	      showerOnTrack.set_origin(track->id());
-	      showerOnTrack.validate();
-	      
-	      event.Add(showerOnTrack);
-	    }
-	    
-	    for (JDetector::const_iterator module = subdetector.lower_bound(z0 - maximal_road_width); module != subdetector.end(); ++module) {
-	      
-	      const double R = module->getX();
-	      const double Z = z0 - module->getZ();
-	      
-	      if (Z < -maximal_road_width) break;
+		NOTICE("loading input from file " << file_name << "... " << flush);
 
-	      const double D  = sqrt(R*R + Z*Z);
-	      const double cd = -Z / D; 
-
-	      for (int i = 0; i != 2; ++i) {
-	    
-		const double Dmax = CDG[i].integral->getUpperKey();
-	    
-		if (D < Dmax) {
-		
-		  try {
-
-		    const double NPE = CDG[i].integral->getNPE(D, cd) * Es * module->size();
-		    const int    N   = gRandom->Poisson(NPE); 
-
-		    if (N != 0) {
-
-		      for (JModule::const_iterator pmt = module->begin(); pmt != module->end(); ++pmt) {
-
-			const double R     = pmt->getX();
-			const double Z     = z0 - pmt->getZ();
-			const double D     = sqrt(R*R + Z*Z);
-			const double cd    = -Z / D; 
-			const double theta = pmt->getTheta();
-			const double phi   = pmt->getPhi();
-			    
-			const double npe = CDG[i].function->getNPE(D, cd, theta, phi) * Es;
-		  
-			int n1 = getNumberOfPhotoElectrons(NPE, N, npe);
-
-			job.Fill((double) (113 + i), (double) n1);
-
-			while (n1 != 0) {
-
-			  const double z  =  Z  +  geanz.getLength(Es, gRandom->Rndm());
-			  const double D  =  sqrt(R*R + z*z);
-			  const double cd = -z / D; 
-			  
-			  const double dt = CDG[i].function->getTime(D, cd, theta, phi, gRandom->Rndm());
-			  const int    n  = getNumberOfPhotoElectrons(n1);		  
-			  
-			  const double t1   = t0  +  (z - Z +  D * getIndexOfRefraction()) / C  +  dt;
-			  const double a1   = n;
-			  const int    type = i == 0 ? +3 : -3;
-			  const uint   id   = event.HitList().size() + 1;
-			  
-			  const Hit hit(id, pmt->getID(), t1, a1, type, track->id(), a1, t1);
-			  
-			  event.Add(hit);
-			  
-			  n1 -= n;
-			}
-		      }
-		    }
-		  }
-		  catch(const exception& error) {
-		    job.Fill((double) (213 + i));
-		  }
+		try {
+			if (*k == "1")
+				f1.load(file_name.c_str());
+			if (*k == "2")
+				f2.load(file_name.c_str());
+			if (*k == "13")
+				f13.load(file_name.c_str());
+			if (*k == "14")
+				f14.load(file_name.c_str());
+		} catch (JException& error) {
+			FATAL(error.what() << endl);
 		}
-	      }
-	    }
-	  }
 
-	  E0 -= Es;
-	  z0 += step;
-	  t0 += step / C;
+		NOTICE("OK" << endl);
 	}
-      }
-    }
 
+	double maximal_road_width = 0.0;  // [m]
 
-    if (geasim) {
+	if (f1.intensity.rbegin()->getX() > maximal_road_width)
+		maximal_road_width = f1.intensity.rbegin()->getX();
+	if (f2.intensity.rbegin()->getX() > maximal_road_width)
+		maximal_road_width = f2.intensity.rbegin()->getX();
+	if (f13.intensity.rbegin()->getX() * getSinThetaC() > maximal_road_width)
+		maximal_road_width = f13.intensity.rbegin()->getX() * getSinThetaC();
+	if (f14.intensity.rbegin()->getX() * getSinThetaC() > maximal_road_width)
+		maximal_road_width = f14.intensity.rbegin()->getX() * getSinThetaC();
 
-      if (event.hasNeutrino()) {
+	NOTICE("Maximal road width [m] " << maximal_road_width << endl);
 
-	// One particle approximation for all secondaries from the neutrino interaction vertex.
+	typedef JFunction1D_t::argument_type argument_type;
+	typedef JFunction1D_t::result_type result_type;
 
-	const Neutrino& neutrino = event.neutrino();
-	const Vec3D&    vertex   = neutrino.position();
-	const double    R        = sqrt(vertex.x*vertex.x + vertex.y*vertex.y);
+	typedef JCDFTable1D<argument_type, result_type> JCDF1D_t;
+	typedef JCDFTable2D<argument_type, result_type> JCDF2D_t;
 
-	if (vertex.z >= header.can.zmin && 
-	    vertex.z <= header.can.zmax && 
-	    R        <= header.can.r) {
+	NOTICE("Setting up fast CDF tables... " << flush);
 
-	  Vec3D shower;
-	  
-	  const double   z0 = 0.0;
-	  const double   t0 = neutrino.t();
-	  double         Es = 0.0;             // total  energy   [GeV]
-	  vector<double> Ei;                   // shower energies [GeV]
-      
-	  for (vector<McTrack>::const_iterator track = event.TrackList().begin(); track != event.TrackList().end(); ++track) {
-	  
-	    if (!is_muon(*track)) {
-	  
-	      if (fabs(vertex.x - track->position().x) < 0.1 &&
-		  fabs(vertex.y - track->position().y) < 0.1 &&
-		  fabs(vertex.z - track->position().z) < 0.1) {
-	      
-		const double E = track->E() * phytia(track->type());
+	JCDF1D_t f1s(f1, 200, 1.7);
+	JCDF1D_t f2s(f2, 200, 1.7);
+	JCDF2D_t f13s(f13, 200, 1.7);
+	JCDF2D_t f14s(f14, 200, 1.7);
 
-		Es     += E;
-		shower += E * track->direction();
+	struct {
+		JCDF1D_t* integral;
+		JCDF4D_t* function;
+	} CDF[] = { { &f1s, &f1 }, { &f2s, &f2 } };
 
-		Ei.push_back(E);
-	      }
-	    }
-	  }
-      
-	  if (Es >= Ecut) {
-	
-	    // generate direct and scattered light from secondary particles.
-	  
-	    const JDetectorSubset subdetector(detector, JGeometry(getPosition(vertex), getDirection(shower)), maximal_road_width);
-	  
-	    for (JDetector::const_iterator module = subdetector.lower_bound(z0 - maximal_road_width); module != subdetector.end(); ++module) {
+	struct {
+		JCDF2D_t* integral;
+		JCDF5D_t* function;
+	} CDG[] = { { &f13s, &f13 }, { &f14s, &f14 } };
 
-	      const double R  = module->getX();
-	      const double Z  = z0 - module->getZ();
+	NOTICE("OK" << endl);
 
-	      if (Z < -maximal_road_width) break;
+	vector<JSharedPointer<JRadiationInterface> > radiation;
 
-	      const double D  = sqrt(R*R + Z*Z);
-	      const double cd = -Z / D; 
-	      
-	      for (int i = 0; i != 2; ++i) {
-		
-		const double Dmax = CDG[i].integral->getUpperKey();
-		
-		if (D < Dmax) {
-		  
-		  try {
-		    
-		    const double NPE = CDG[i].integral->getNPE(D, cd) * Es * module->size();
-		    const int    N   = gRandom->Poisson(NPE); 
-		    
-		    if (N != 0) {
-		      
-		      for (JModule::const_iterator pmt = module->begin(); pmt != module->end(); ++pmt) {
-			
-			const double R     = pmt->getX();
-			const double Z     = z0 - pmt->getZ();
-			const double D     = sqrt(R*R + Z*Z);
-			const double cd    = -Z / D; 
-			const double theta = pmt->getTheta();
-			const double phi   = pmt->getPhi();
-			
-			const double npe = CDG[i].function->getNPE(D, cd, theta, phi) * Es;
-			
-			int n1 = getNumberOfPhotoElectrons(NPE, N, npe);
+	if (true) {
 
-			job.Fill((double) (123 + i), (double) n1);
+		NOTICE("Setting up radiation tables... " << flush);
 
-			while (n1 != 0) {
-			  
-			  double z  = 0.0;
-			  double y  = gRandom->Uniform(Es);
+		JRadiation hydrogen(1.0, 1.0, 40, 0.01, 0.1, 0.1);
+		JRadiation oxygen(8.0, 16.0, 40, 0.01, 0.1, 0.1);
+		JRadiation chlorine(17.0, 35.0, 40, 0.01, 0.1, 0.1);
 
-			  for (vector<double>::const_iterator energy = Ei.begin(); energy != Ei.end(); ++energy) {
-			    
-			    y -= *energy;
-			    
-			    if (y < 0.0) {
-			      z = Z  +  geanz.getLength(*energy, gRandom->Rndm());
-			      break;
-			    }
-			  }
+		JSharedPointer<JRadiation> Hydrogen(
+				new JRadiationFunction(hydrogen, 300, 0.2, 1.0e11));
+		JSharedPointer<JRadiation> Oxygen(
+				new JRadiationFunction(oxygen, 300, 0.2, 1.0e11));
+		JSharedPointer<JRadiation> Chlorine(
+				new JRadiationFunction(chlorine, 300, 0.2, 1.0e11));
 
-			  const double D  =  sqrt(R*R + z*z);
-			  const double cd = -z / D; 
-			
-			  const double dt = CDG[i].function->getTime(D, cd, theta, phi, gRandom->Rndm());
-			  const int    n  = getNumberOfPhotoElectrons(n1);		  
-			
-			  const double t1   = t0  +  (z - Z +  D * getIndexOfRefraction()) / C  +  dt;
-			  const double a1   = n;
-			  const int    type = i == 0 ? +99 : -99;
-			  const uint   id   = event.HitList().size() + 1;
-			
-			  const Hit hit(id, pmt->getID(), t1, a1, type, 0, a1, t1);
-			
-			  event.Add(hit);
-			
-			  n1 -= n;
+		JRadiationSource::source_type EErad(&JRadiation::TotalCrossSectionEErad,
+				&JRadiation::EfromEErad);
+		JRadiationSource::source_type Brems(&JRadiation::TotalCrossSectionBrems,
+				&JRadiation::EfromBrems);
+		JRadiationSource::source_type GNrad(&JRadiation::TotalCrossSectionGNrad,
+				&JRadiation::EfromGNrad);
+
+		radiation.push_back(
+				new JRadiationSource(Oxygen, DENSITY_SEA_WATER * JSeaWater::O,
+						EErad));
+		radiation.push_back(
+				new JRadiationSource(Chlorine,
+						DENSITY_SEA_WATER * JSeaWater::Cl, EErad));
+		radiation.push_back(
+				new JRadiationSource(Hydrogen, DENSITY_SEA_WATER * JSeaWater::H,
+						EErad));
+
+		radiation.push_back(
+				new JRadiationSource(Oxygen, DENSITY_SEA_WATER * JSeaWater::O,
+						Brems));
+		radiation.push_back(
+				new JRadiationSource(Chlorine,
+						DENSITY_SEA_WATER * JSeaWater::Cl, Brems));
+		radiation.push_back(
+				new JRadiationSource(Hydrogen, DENSITY_SEA_WATER * JSeaWater::H,
+						Brems));
+
+		radiation.push_back(
+				new JRadiationSource(Oxygen, DENSITY_SEA_WATER * JSeaWater::O,
+						GNrad));
+		radiation.push_back(
+				new JRadiationSource(Chlorine,
+						DENSITY_SEA_WATER * JSeaWater::Cl, GNrad));
+		radiation.push_back(
+				new JRadiationSource(Hydrogen, DENSITY_SEA_WATER * JSeaWater::H,
+						GNrad));
+
+		NOTICE("OK" << endl);
+	}
+
+	JDetector detector;
+
+	try {
+
+		NOTICE("Load detector... " << flush);
+
+		load(detectorFile, detector);
+
+		NOTICE("OK" << endl);
+	} catch (JException& error) {
+		FATAL(error);
+	}
+
+	Header header;
+
+	try {
+		header = inputFile.getHeader();
+	} catch (JException& error) {
+		FATAL(error);
+	}
+
+	if (header.start_run) {
+		Event::set_runNumber(header.start_run.run_id);
+	}
+
+	if (!header.coord_origin && header.can) {
+
+		WARNING("Setting coordinate origin relative to bottom of can." << endl);
+
+		header.coord_origin = MONTE_CARLO::coord_origin(0.0, 0.0,
+				-header.can.zmin);
+	}
+
+	if (header.coord_origin) {
+
+		detector -= JPosition3D(header.coord_origin.x, header.coord_origin.y,
+				header.coord_origin.z);
+		Zbed -= header.coord_origin.z;
+	}
+
+	JCylinder3D cylinder(detector.begin(), detector.end());
+
+	cylinder.addMargin(maximal_road_width);
+
+	if (cylinder.getZmin() < Zbed) {
+		cylinder.setZmin(Zbed);
+	}
+
+	outputFile.open();
+
+	if (!outputFile.is_open()) {
+		FATAL("Error opening file " << outputFile << endl);
+	}
+
+	outputFile.put(header);
+	outputFile.put(*gRandom);
+
+	TProfile cpu("cpu", NULL, 14, 1.0, 7.0);
+	TH1D job("job", NULL, 400, 0.5, 400.5);
+	TProfile ems("ems", NULL, 14, 1.0, 7.0);
+
+	JTimer timer;
+
+	cout << "\nRunning with " << omp_get_max_threads() << " thread(s)...\n";
+
+	int event_num = 0;
+
+	vector<JEvent> eventList;
+
+	double total_IO_time = 0;
+
+	double read_time_start = omp_get_wtime();
+
+	for (JMultipleFileScanner<Event>& in = inputFile; in.hasNext();) {
+
+		++event_num;
+
+		STATUS("event: " << setw(10) << in.getCounter() << '\r');
+		DEBUG(endl);
+
+		job.Fill(1.0);
+
+		JEvent event(*in.next());
+
+		event.removeHits();
+
+		eventList.push_back(event);
+	}
+
+	double read_time_end = omp_get_wtime();
+
+	total_IO_time += (read_time_end - read_time_start);
+
+	double total_comp_time_start = omp_get_wtime();
+
+#pragma omp parallel
+	{
+		TRandom *r3 = new TRandom3();
+		r3->SetSeed(seed);
+
+#pragma omp for schedule(dynamic, 1)
+		for (int event_count = 0; event_count < 1000; ++event_count) {
+
+			//timer.reset();
+			//timer.start();
+
+			for (vector<McTrack>::const_iterator track =
+					eventList[event_count].TrackList().begin();
+					track < eventList[event_count].TrackList().end(); ++track) {
+
+				// (anti) muon
+
+				if (is_muon(*track)) {
+
+					job.Fill(2.0);
+
+					pair<double, double> intersection;
+
+					intersection = cylinder.getIntersection(getAxis(*track));
+
+					double Zmin = intersection.first;
+					double Zmax = intersection.second;
+
+					if (Zmax <= 0.0) {
+						continue;
+					}
+
+					// muon propagator
+
+					JVertex vertex(0.0, track->t(), track->E());
+
+					if (vertex.getZ() < Zbed) {
+
+						// propagate muon through rock
+
+						if (track->direction().z <= 0.0) {
+							continue;
+						}
+
+						double ds = (Zbed - vertex.getZ())
+								/ track->direction().z;
+
+						if (vertex.getRange(gRock) > ds)
+							vertex.step(gRock, ds);
+						else
+							continue;
+					}
+
+					if (vertex.getZ() < Zmin) {
+
+						// propagate muon through water
+
+						double ds = Zmin - vertex.getZ();
+
+						if (vertex.getRange(gWater) > ds)
+							vertex.step(gWater, ds);
+						else
+							continue;
+					}
+
+					if (vertex.getRange() <= 0.1) {
+						continue;
+					}
+
+					job.Fill(3.0);
+
+					JDetectorSubset subdetector(detector, getAxis(*track),
+							maximal_road_width);
+
+					if (subdetector.empty()) {
+						continue;
+					}
+
+					job.Fill(4.0);
+
+					JTrack muon(vertex);
+
+					while (vertex.getE() >= Emin && vertex.getZ() < Zmax) {
+
+						int N = radiation.size();
+
+						double li[N];     // inverse interaction lengths
+						double ls = 1.0e-5; // minimal total inverse interaction length (100 km)^-1
+
+						for (int i = 0; i != N; ++i) {
+							ls += li[i] =
+									radiation[i]->getInverseInteractionLength(
+											vertex.getE());
+						}
+
+						double temp;
+
+						temp = r3->Exp(1.0);
+
+						double ds = min(temp / ls, vertex.getRange());
+
+						vertex.step(ds);
+
+						if (vertex.getE() >= Emin) {
+
+							double Es = 0.0;      // shower energy [GeV]
+							double y;
+
+							y = r3->Uniform(ls);
+
+							for (int i = 0; i != N; ++i) {
+
+								y -= li[i];
+
+								if (y < 0.0) {
+									Es = radiation[i]->getEnergyOfShower(
+											vertex.getE()); // shower energy [GeV]
+									break;
+								}
+							}
+
+							vertex.applyEloss(Es);
+
+							if (Es >= Ecut) {
+								muon.push_back(vertex);
+							}
+						}
+					}
+
+					if (vertex.getE() < Emin && vertex.getRange() > 0.0) {
+
+						vertex.step(vertex.getRange());
+
+						muon.push_back(vertex);
+					}
+
+					//double hit_time_start = omp_get_wtime();
+
+					// generate direct and scattered light from muon
+
+					Zmin = muon.begin()->getZ()
+							- maximal_road_width / getTanThetaC();
+					Zmax = muon.rbegin()->getZ();
+
+					for (JDetector::const_iterator module =
+							subdetector.lower_bound(Zmin);
+							module < subdetector.lower_bound(Zmax); ++module) {
+
+						double z0 = muon.begin()->getZ();
+						double t0 = muon.begin()->getT();
+						double R = module->getX();
+
+						if (module->getZ() - R / getTanThetaC()
+								>= muon.begin()->getZ()
+								&& module->getZ() - R / getTanThetaC()
+										<= muon.rbegin()->getZ()) {
+
+							for (int i = 0; i != 2; ++i) {
+
+								// for (i = 0)
+								double Rmax = CDF[i].integral->rbegin()->getX();
+
+								if (R < Rmax) {
+
+									try {
+
+										double NPE;
+
+										NPE = CDF[i].integral->getNPE(R)
+												* module->size();
+
+										int N;
+
+										N = r3->Poisson(NPE);
+
+										double ns = 0.0;
+
+										for (JModule::const_iterator pmt =
+												module->begin();
+												pmt != module->end() && N != 0;
+												++pmt) {
+
+											double R = pmt->getX();
+											double Z = z0 - pmt->getZ();
+											double theta = pmt->getTheta();
+											double phi = fabs(pmt->getPhi());
+
+											double npe;
+
+#pragma omp critical
+											{
+												npe = CDF[i].function->getNPE(R,
+														theta, phi);
+											}
+
+											ns += npe;
+
+											int n1 = getNumberOfPhotoElectrons(
+													NPE, N, npe, &(*r3));
+
+											job.Fill((double) (101 + i),
+													(double) n1);
+
+											while (n1 != 0) {
+
+												double temp;
+
+												temp = r3->Rndm();
+
+												double dt;
+
+#pragma omp critical
+												{
+													dt =
+															CDF[i].function->getTime(
+																	R, theta,
+																	phi, temp);
+												}
+
+												int n =
+														getNumberOfPhotoElectrons(
+																n1);
+
+												double t1 = t0
+														+ (R * getTanThetaC()
+																- Z) / C + dt;
+												double a1 = n;
+												int type =
+														(i == 0 ?
+																HIT_TYPE_MUON_DIRECT :
+																HIT_TYPE_MUON_SCATTERED);
+												uint id =
+														eventList[event_count].HitList().size()
+																+ 1;
+
+												McHit hit(id, pmt->getID(), t1,
+														a1, type, track->id(),
+														a1, t1);
+
+												eventList[event_count].Add(hit);
+
+												n1 -= n;
+											}
+										}
+
+										if (ns > NPE) {
+
+											job.Fill((double) (301 + i));
+
+										}
+									} catch (exception& error) {
+
+										job.Fill((double) (201 + i));
+
+									}
+								}
+							}
+						}
+					}
+
+					// generate direct and scattered light from EM showers.
+
+					for (JTrack::const_iterator vertex = muon.begin();
+							vertex < muon.end(); ++vertex) {
+
+						double t0 = vertex->getT();
+						double z0 = vertex->getZ();
+						double Es = vertex->getEs();
+
+						if (Es >= Ecut) {
+
+							int trackID = track->id();
+
+							if (writeEMShowers) {
+								trackID =
+										eventList[event_count].secondary().size()
+												+ 1;
+							}
+
+							bool secondaryHit = false;
+
+							Zmin = z0 - maximal_road_width;
+							Zmax = z0 + maximal_road_width;
+
+							for (JDetector::const_iterator module =
+									subdetector.lower_bound(Zmin);
+									module < subdetector.lower_bound(Zmax);
+									++module) {
+
+								double R = module->getX();
+								double Z = z0 - module->getZ();
+
+								double D = sqrt(R * R + Z * Z);
+								double cd = -Z / D;
+
+								for (int i = 0; i != 2; ++i) {
+
+									double Dmax =
+											CDG[i].integral->rbegin()->getX();
+
+									if (D < Dmax) {
+
+										try {
+
+											double NPE;
+
+											NPE = CDG[i].integral->getNPE(D, cd)
+													* Es * module->size();
+
+											int N;
+
+											N = r3->Poisson(NPE);
+
+											double ns = 0.0;
+
+											for (JModule::const_iterator pmt =
+													module->begin();
+													pmt < module->end();
+													++pmt) {
+
+												if (N != 0) {
+
+													double R = pmt->getX();
+													double Z = z0 - pmt->getZ();
+													double theta =
+															pmt->getTheta();
+													double phi = fabs(
+															pmt->getPhi());
+													double D = sqrt(
+															R * R + Z * Z);
+													double cd = -Z / D;
+
+													double npe;
+
+#pragma omp critical
+													{
+														npe =
+																CDG[i].function->getNPE(
+																		D, cd,
+																		theta,
+																		phi)
+																		* Es;
+													}
+
+													ns += npe;
+
+													int n1 =
+															getNumberOfPhotoElectrons(
+																	NPE, N, npe,
+																	&(*r3));
+
+													job.Fill((double) (113 + i),
+															(double) n1);
+
+													while (n1 != 0) {
+
+														double temp;
+
+														temp = r3->Rndm();
+
+														double z =
+																Z
+																		+ geanz.getLength(
+																				Es,
+																				temp);
+														double D = sqrt(
+																R * R + z * z);
+														double cd = -z / D;
+
+														temp = r3->Rndm();
+
+														double dt;
+
+#pragma omp critical
+														{
+															dt =
+																	CDG[i].function->getTime(
+																			D,
+																			cd,
+																			theta,
+																			phi,
+																			temp);
+														}
+
+														int n =
+																getNumberOfPhotoElectrons(
+																		n1);
+
+														double t1 =
+																t0
+																		+ (z - Z
+																				+ D
+																						* getIndexOfRefraction())
+																				/ C
+																		+ dt;
+														double a1 = n;
+														int type =
+																(i == 0 ?
+																		HIT_TYPE_SHOWER_DIRECT :
+																		HIT_TYPE_SHOWER_SCATTERED);
+														uint id =
+																eventList[event_count].HitList().size()
+																		+ 1;
+
+														McHit hit(id,
+																pmt->getID(),
+																t1, a1, type,
+																trackID, a1,
+																t1);
+
+														eventList[event_count].Add(
+																hit);
+
+														n1 -= n;
+
+														secondaryHit = true;
+													}
+												}
+											}
+
+											if (ns > NPE) {
+
+												job.Fill((double) (313 + i));
+
+											}
+										} catch (exception& error) {
+
+											job.Fill((double) (213 + i));
+
+										}
+									}
+								}
+							}
+
+							if (writeEMShowers && secondaryHit) {
+
+								JPosition3D pos(0.0, 0.0, z0);
+								JDirection3D dir = getDirection(*track);
+
+								pos.add(getPosition(*track));
+								pos.rotate_back(JRotation3D(dir));
+
+								Secondary showerOnTrack;
+
+								showerOnTrack.set_id(trackID);
+								showerOnTrack.set_t(t0);
+								showerOnTrack.set_position(pos.getX(),
+										pos.getY(), pos.getZ());
+								showerOnTrack.set_direction(dir.getDX(),
+										dir.getDY(), dir.getDZ());
+								showerOnTrack.set_E(Es);
+								showerOnTrack.set_type(-1); // negative gamma particle code
+								showerOnTrack.set_origin(track->id());
+								showerOnTrack.validate();
+
+								eventList[event_count].Add(showerOnTrack);
+
+							}
+						}
+					}
+
+					//double hit_time_end = omp_get_wtime();
+
+					//total_hit_time += (hit_time_end - hit_time_start);
+
+					Zmin = muon.begin()->getZ();
+					Zmax = muon.rbegin()->getZ();
+
+					if (Zmax > Zmin) {
+
+						ems.Fill(log10(muon.begin()->getE()),
+								(double) muon.size() / (Zmax - Zmin));
+
+					}
+				}
 			}
-		      }
-		    }
-		  }
-		  catch(const exception& error) {
-		    job.Fill((double) (223 + i));
-		  }
+
+			// merge hits on same PMT within maximal time window
+
+			eventList[event_count].mergeHits(Tmax);
+
+			// timer.stop();
+
+			if (eventList[event_count].hasNeutrino()
+					&& !eventList[event_count].HitList().empty()) {
+
+				cpu.Fill(log10(eventList[event_count].neutrino().E()),
+						(double) timer.usec_ucpu * 1.0e-3);
+
+			}
 		}
-	      }
-	    }
-	  }
 	}
-      }
-    }
 
-    // merge hits on same PMT within maximal time window
+	double total_comp_time_end = omp_get_wtime();
 
-    event.mergeHits(Tmax);
+	double write_time_start = omp_get_wtime();
 
-    timer.stop();
+	for (int event_count = 0; event_count < 1000; ++event_count) {
 
-    if (event.hasNeutrino() && !event.HitList().empty())
-      cpu.Fill(log10(event.neutrino().E()), (double) timer.usec_ucpu * 1.0e-3);
+		if (!eventList[event_count].HitList().empty()) {
 
-    if (!event.HitList().empty()) {
+			outputFile.put(eventList[event_count]);
 
-      MonteCarloEvent_Writer.Write(event);
+			job.Fill(10.0);
 
-      job.Fill(5.0);
-    }
-  }
-  STATUS(endl); 
+		}
 
-  NOTICE("Job summary" << endl);
+	}
 
-  NOTICE(left << setw(30) << "Number of events input      " << right << setw(10) << (int) job.GetBinContent(  1) << endl);
-  NOTICE(left << setw(30) << "Number of muons             " << right << setw(10) << (int) job.GetBinContent(  2) << endl);
-  NOTICE(left << setw(30) << "Number of muons in can      " << right << setw(10) << (int) job.GetBinContent(  3) << endl);
-  NOTICE(left << setw(30) << "Number of muons within road " << right << setw(10) << (int) job.GetBinContent(  4) << endl);
-  NOTICE(left << setw(30) << "Number of events output     " << right << setw(10) << (int) job.GetBinContent(  5) << endl);
+	double write_time_end = omp_get_wtime();
 
-  NOTICE(left << setw(30) << "Number of photons  1        " << right << setw(10) << (int) job.GetBinContent(101) << endl);
-  NOTICE(left << setw(30) << "Number of photons  2        " << right << setw(10) << (int) job.GetBinContent(102) << endl);
-  NOTICE(left << setw(30) << "Number of photons 13        " << right << setw(10) << (int) job.GetBinContent(113) << endl);
-  NOTICE(left << setw(30) << "Number of photons 14        " << right << setw(10) << (int) job.GetBinContent(114) << endl);
-  NOTICE(left << setw(30) << "Number of photons 23        " << right << setw(10) << (int) job.GetBinContent(123) << endl);
-  NOTICE(left << setw(30) << "Number of photons 24        " << right << setw(10) << (int) job.GetBinContent(124) << endl);
+	total_IO_time += (write_time_end - write_time_start);
 
-  NOTICE(left << setw(30) << "Number of errors   1        " << right << setw(10) << (int) job.GetBinContent(201) << endl);
-  NOTICE(left << setw(30) << "Number of errors   2        " << right << setw(10) << (int) job.GetBinContent(202) << endl);
-  NOTICE(left << setw(30) << "Number of errors  13        " << right << setw(10) << (int) job.GetBinContent(213) << endl);
-  NOTICE(left << setw(30) << "Number of errors  14        " << right << setw(10) << (int) job.GetBinContent(214) << endl);
-  NOTICE(left << setw(30) << "Number of errors  23        " << right << setw(10) << (int) job.GetBinContent(223) << endl);
-  NOTICE(left << setw(30) << "Number of errors  24        " << right << setw(10) << (int) job.GetBinContent(224) << endl);
+	STATUS(endl);
 
-  out->Write();
-  out->Close();
+	outputFile.put(*gRandom);
+
+	outputFile.close();
+
+	/*cout << "Total time - hit detection - all events = " << total_hit_time
+	 << " seconds.\n";*/
+	cout << "Total time - all events = "
+			<< total_comp_time_end - total_comp_time_start << " seconds.\n";
+	cout << "Total time - IO = " << total_IO_time << " seconds.\n";
 }
